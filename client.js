@@ -274,7 +274,62 @@ function normalizeInventory(body) {
       },
     };
   });
-  return { productId: resp.Inventory.productId, parts, messages };
+  return { productId: resp.Inventory.productId, stats: inventoryStats(parts), parts, messages };
+}
+
+// A compact picture of a whole style's inventory, so one lookup answers the
+// questions that matter without reading hundreds of parts: what part IDs
+// look like, which warehouses LAT has and how full they are, whether
+// quantities pile up at a ceiling (many parts at the same top number), whether
+// arrival dates and lead times are actually filled in.
+function inventoryStats(parts) {
+  const locations = {};
+  const colors = new Set();
+  const sizes = new Set();
+  const lead = new Map();
+  const futureDates = [];
+  const futureSamples = [];
+  let futureEntries = 0, partsWithLead = 0, buyToOrder = 0, manufactured = 0;
+
+  parts.forEach((p) => {
+    if (p.color) colors.add(p.color);
+    if (p.size) sizes.add(p.size);
+    if (p.buyToOrder) buyToOrder += 1;
+    if (p.manufacturedItem) manufactured += 1;
+    if (p.replenishmentLeadTimeDays != null) {
+      partsWithLead += 1;
+      lead.set(p.replenishmentLeadTimeDays, (lead.get(p.replenishmentLeadTimeDays) || 0) + 1);
+    }
+    p.locations.forEach((l) => {
+      const s = (locations[l.id] = locations[l.id] || { name: l.name, rows: 0, zero: 0, max: 0, atMax: 0, total: 0 });
+      const q = l.quantity || 0;
+      s.rows += 1;
+      s.total += q;
+      if (q === 0) s.zero += 1;
+      if (q > s.max) s.max = q;
+      l.future.forEach((f) => {
+        futureEntries += 1;
+        if (f.availableOn) futureDates.push(f.availableOn);
+        if (futureSamples.length < 5) futureSamples.push({ partId: p.partId, location: l.id, quantity: f.quantity, availableOn: f.availableOn });
+      });
+    });
+  });
+  parts.forEach((p) => p.locations.forEach((l) => { if ((l.quantity || 0) === locations[l.id].max) locations[l.id].atMax += 1; }));
+  futureDates.sort();
+
+  return {
+    partCount: parts.length,
+    idSamples: parts.slice(0, 5).map((p) => p.partId),
+    colorCount: colors.size,
+    colors: [...colors].slice(0, 40),
+    sizes: [...sizes],
+    locations,
+    futureAvailability: { entries: futureEntries, withDates: futureDates.length, earliest: futureDates[0] ?? null, latest: futureDates[futureDates.length - 1] ?? null, samples: futureSamples },
+    partsWithLeadTime: partsWithLead,
+    leadTimeDaysCounts: Object.fromEntries([...lead.entries()].sort((a, b) => b[1] - a[1]).slice(0, 10)),
+    buyToOrder,
+    manufacturedItem: manufactured,
+  };
 }
 
 function normalizeSellable(body) {
