@@ -5,15 +5,19 @@
  * limits, and allowed values follow LAT's own XSD files (SendPORequest,
  * SharedObjectsPO, ...); the builder below is validated against them in tests.
  *
- * THIS STAGE CANNOT SEND AN ORDER. It offers two things only:
- *   - getSupportedOrderTypes: a read-only call that shows whether your login
- *     can use the Purchase Order service and which order types LAT accepts.
- *   - previewPurchaseOrder: checks an order and builds the exact request that
- *     would be sent — with the login shown as a placeholder — and sends nothing.
- *
- * Why so careful: LAT has no test endpoint, so a sendPO is always a real
- * order, and the PO service has no cancel or lookup. Sending is added later,
- * together with a record of orders already sent (to stop duplicates).
+ * Sending a real order is OFF unless the server sets LAT_PO_SEND_ENABLED=true.
+ * LAT has no test endpoint, so every sendPO is a REAL order, and the PO
+ * service has no cancel or lookup. So, on the server (not just on screen):
+ *   - the PO number must be typed to confirm;
+ *   - the order is checked against LAT's limits and its request is built
+ *     BEFORE anything is reserved;
+ *   - the PO number is reserved in the shared order record first, and if that
+ *     can't be done, nothing is sent; a PO number already pending/sent/unknown
+ *     is refused;
+ *   - if LAT doesn't answer, the order MAY exist: the PO number stays locked
+ *     until an admin resolves it.
+ * Also here: a read-only access check (getSupportedOrderTypes) and a preview
+ * that builds and checks the request and sends nothing.
  */
 
 const { SERVICES, esc, credentials, requestElement, post, parseBody, responseOf, messagesOf, describeMessages, toArray } = require("./client")._shared;
@@ -241,4 +245,110 @@ async function getSupportedOrderTypes() {
   return { orderTypes, messages };
 }
 
-module.exports = { ORDER_TYPES, validatePurchaseOrder, buildSendPoXml, previewPurchaseOrder, getSupportedOrderTypes, _prettyXml: prettyXml };
+// ---------- Sending (real orders) ----------
+
+const sendEnabled = () => process.env.LAT_PO_SEND_ENABLED === "true";
+const ledgerUrl = () => (process.env.PO_HISTORY_BACKEND_URL || "").replace(/\/$/, "");
+const sendTimeoutMs = () => Number(process.env.LAT_PO_SEND_TIMEOUT_MS) || 60000;
+
+// The shared record of orders sent, kept in po-history-backend. The caller's own
+// login token is passed along, so the record applies the same sign-in rules.
+async function ledgerCall(method, path, body, authHeader) {
+  const base = ledgerUrl();
+  if (!base) throw fail(503, "The order record isn't set up on this server (PO_HISTORY_BACKEND_URL), so nothing was sent.");
+  let res;
+  try {
+    res = await fetch(base + path, {
+      method,
+      headers: { Authorization: authHeader || "", ...(body ? { "Content-Type": "application/json" } : {}) },
+      body: body ? JSON.stringify(body) : undefined,
+      signal: AbortSignal.timeout(15000),
+    });
+  } catch {
+    throw fail(503, "Couldn't reach the order record, so nothing was sent.");
+  }
+  return { status: res.status, json: await res.json().catch(() => null) };
+}
+
+async function sendPurchaseOrder(input, { user, authHeader, now = new Date() } = {}) {
+  if (!sendEnabled()) throw fail(503, "Sending orders to LAT is switched off on the server. Set LAT_PO_SEND_ENABLED=true on the LAT service to turn it on.");
+  const { errors, clean } = validatePurchaseOrder(input);
+  if (errors.length) throw fail(400, errors.join(" "), { details: errors });
+  if (str(input && input.confirmPoNumber) !== clean.poNumber) {
+    throw fail(400, "To send a real order, type its PO number exactly to confirm.", { details: ["To send a real order, type its PO number exactly to confirm."] });
+  }
+
+  // Built BEFORE reserving, so a missing login or a bug can't leave a PO number locked for nothing.
+  const { xml, totalAmount } = buildSendPoXml(clean, { now });
+  const summary = { lines: clean.lines.length, pieces: clean.lines.reduce((s, l) => s + l.qty, 0), totalAmount, shipTo: clean.shipTo.companyName ? `${clean.shipTo.companyName}, ${clean.shipTo.city}` : clean.shipTo.city, freight: `${clean.freight.carrier} ${clean.freight.service}` };
+
+  const reserved = await ledgerCall("POST", "/api/supplier-orders/reserve", { supplier: "lat", poNumber: clean.poNumber, placedBy: (user && user.email) || null, summary }, authHeader);
+  if (reserved.status === 409) {
+    const e = reserved.json && reserved.json.existing;
+    throw fail(409, `PO ${clean.poNumber} was already ${e ? e.status : "used"}${e && e.reservedAt ? ` (${String(e.reservedAt).slice(0, 16).replace("T", " ")} UTC${e.placedBy ? ` by ${e.placedBy}` : ""})` : ""}. Nothing was sent. Use a different PO number for a new order.`, { existing: e || null });
+  }
+  if (reserved.status !== 200) throw fail(503, `The order record wouldn't reserve this PO (HTTP ${reserved.status}${reserved.json && reserved.json.error ? `: ${reserved.json.error}` : ""}), so nothing was sent.`);
+
+  // From here on the PO number is reserved: whatever happens, the record is updated to say what.
+  const finish = async (status, message, transactionId) => {
+    try {
+      const r = await ledgerCall("POST", "/api/supplier-orders/finish", { supplier: "lat", poNumber: clean.poNumber, status, message, transactionId }, authHeader);
+      return r.status === 200 ? null : `The order record couldn't be updated (HTTP ${r.status}); PO ${clean.poNumber} stays locked until an admin resolves it.`;
+    } catch {
+      return `The order record couldn't be updated; PO ${clean.poNumber} stays locked until an admin resolves it.`;
+    }
+  };
+
+  let reply;
+  try {
+    reply = await post(SERVICES.purchaseOrder, "sendPO", xml, sendTimeoutMs());
+  } catch (err) {
+    if (err.timeout) {
+      const warn = await finish("unknown", err.message);
+      throw fail(502, `LAT didn't answer in time, so this order MAY have been placed. PO ${clean.poNumber} is now locked. Ask LAT whether it arrived; an admin can then release it or mark it as sent.${warn ? ` ${warn}` : ""}`, { unknownOutcome: true });
+    }
+    const warn = await finish("failed", err.message); // couldn't connect: nothing was delivered
+    throw fail(502, `${err.message}. The order was not sent.${warn ? ` ${warn}` : ""}`);
+  }
+
+  let resp;
+  try {
+    resp = responseOf(parseBody(reply), "SendPOResponse");
+  } catch (err) {
+    if (/SOAP fault/.test(err.message)) {
+      const warn = await finish("failed", err.message); // LAT refused it outright
+      throw fail(422, `LAT rejected the order: ${err.message}. It was not placed; you can fix it and send again.${warn ? ` ${warn}` : ""}`);
+    }
+    const warn = await finish("unknown", err.message); // an odd reply: can't tell
+    throw fail(502, `LAT's reply wasn't understood (${err.message}), so this order MAY have been placed. PO ${clean.poNumber} is now locked. Ask LAT whether it arrived.${warn ? ` ${warn}` : ""}`, { unknownOutcome: true });
+  }
+
+  const messages = messagesOf(resp);
+  const problems = messages.filter((m) => m.severity === "Error");
+  if (problems.length) {
+    const warn = await finish("failed", describeMessages(problems));
+    throw fail(422, `LAT rejected the order — ${describeMessages(problems)}. It was not placed; you can fix it and send again.${warn ? ` ${warn}` : ""}`, { messages });
+  }
+
+  const transactionId = resp.transactionId ? String(resp.transactionId) : null;
+  const warnings = transactionId ? [] : ["LAT didn't return a transaction ID. Confirm with LAT that the order arrived."];
+  const ledgerWarning = await finish("sent", messages.length ? describeMessages(messages) : null, transactionId);
+  return { sent: true, transactionId, messages, warnings, ...(ledgerWarning ? { ledgerWarning } : {}), placedAt: now.toISOString(), summary };
+}
+
+/** The shared record of orders sent from the app (read-only). */
+async function listLatOrders(authHeader) {
+  const r = await ledgerCall("GET", "/api/supplier-orders?supplier=lat", null, authHeader);
+  if (r.status !== 200) throw fail(502, `Couldn't read the order record (HTTP ${r.status}).`);
+  return { orders: r.json.orders || [] };
+}
+
+/** Admin only (the record enforces it): settle an order stuck as pending/unknown after checking with LAT. */
+async function resolveLatOrder({ poNumber, resolution, reason }, authHeader) {
+  const r = await ledgerCall("POST", "/api/supplier-orders/resolve", { supplier: "lat", poNumber, resolution, reason }, authHeader);
+  if (r.status === 403) throw fail(403, "Only an admin can resolve an order.");
+  if (r.status !== 200) throw fail(r.status === 400 || r.status === 404 || r.status === 409 ? r.status : 502, (r.json && r.json.error) || `The order record refused (HTTP ${r.status}).`);
+  return { entry: r.json.entry };
+}
+
+module.exports = { ORDER_TYPES, validatePurchaseOrder, buildSendPoXml, previewPurchaseOrder, getSupportedOrderTypes, sendPurchaseOrder, listLatOrders, resolveLatOrder, _prettyXml: prettyXml };

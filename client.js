@@ -175,7 +175,8 @@ function post(service, action, bodyXml, timeoutMs = 30000) {
     req.on("error", (err) => reject(new Error(`Couldn't reach LAT: ${err.message}`)));
     req.on("timeout", () => {
       req.destroy();
-      reject(new Error(`LAT didn't respond within ${Math.round(timeoutMs / 1000)}s`));
+      // Flagged because for an ORDER a timeout is not "didn't happen": LAT may have received it.
+      reject(Object.assign(new Error(`LAT didn't respond within ${Math.round(timeoutMs / 1000)}s`), { timeout: true }));
     });
     req.write(payload);
     req.end();

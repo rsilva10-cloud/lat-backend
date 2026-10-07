@@ -3,7 +3,7 @@ const express = require("express");
 const cors = require("cors");
 const { requireAuth } = require("./sessionAuth");
 const { getInventoryLevels, getSellableProducts, getPricing, getFobPoints, PRICE_TYPES } = require("./client");
-const { getSupportedOrderTypes, previewPurchaseOrder } = require("./po");
+const { getSupportedOrderTypes, previewPurchaseOrder, sendPurchaseOrder, listLatOrders, resolveLatOrder } = require("./po");
 
 const app = express();
 
@@ -30,7 +30,11 @@ const route = (fn) => async (req, res) => {
   try {
     res.json(await fn(req));
   } catch (err) {
-    if (err.status === 400) return res.status(400).json({ error: err.message, ...(err.details ? { details: err.details } : {}) });
+    // 400 your input, 403 not allowed, 409 PO already used, 422 LAT rejected it, 503 sending off / record unavailable.
+    if ([400, 403, 409, 422, 503].includes(err.status)) {
+      return res.status(err.status).json({ error: err.message, ...(err.details ? { details: err.details } : {}), ...(err.existing ? { existing: err.existing } : {}), ...(err.unknownOutcome ? { unknownOutcome: true } : {}) });
+    }
+    if (err.unknownOutcome) return res.status(502).json({ error: err.message, unknownOutcome: true });
     console.error("LAT request failed:", err.message);
     res.status(502).json({ error: err.message || "LAT request failed" });
   }
@@ -78,7 +82,7 @@ app.get("/api/lat/fob-points", requireAuth, route((req) => {
   return getFobPoints({ productId }, { raw: wantsRaw(req) });
 }));
 
-// ---------- Purchase orders (READ-ONLY in this version: nothing here can send an order) ----------
+// ---------- Purchase orders ----------
 
 // Read-only. Shows whether your login can use LAT's Purchase Order service
 // and which order types LAT accepts. Changes nothing at LAT.
@@ -87,6 +91,14 @@ app.get("/api/lat/po/order-types", requireAuth, route(() => getSupportedOrderTyp
 // Checks an order against LAT's limits and returns the exact request that
 // would be sent, with the login shown as a placeholder. Sends nothing.
 app.post("/api/lat/po/preview", requireAuth, route((req) => previewPurchaseOrder(req.body)));
+
+// SENDS A REAL ORDER (LAT has no test mode). Off unless LAT_PO_SEND_ENABLED=true. Needs the order
+// plus confirmPoNumber (the PO number typed again). See po.js for the full set of safeguards.
+app.post("/api/lat/po/send", requireAuth, route((req) => sendPurchaseOrder(req.body, { user: req.user, authHeader: req.headers.authorization })));
+
+// The shared record of orders sent from the app, and (admins only) settling one that's stuck.
+app.get("/api/lat/po/orders", requireAuth, route((req) => listLatOrders(req.headers.authorization)));
+app.post("/api/lat/po/resolve", requireAuth, route((req) => resolveLatOrder(req.body || {}, req.headers.authorization)));
 
 const port = process.env.PORT || 3006;
 app.listen(port, () => console.log(`LAT backend listening on :${port}`));
