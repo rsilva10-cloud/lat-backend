@@ -51,8 +51,10 @@ const SERVICES = {
 const PRICE_TYPES = ["Customer", "List", "Net"]; // from LAT's schema
 const baseUrl = () => (process.env.LAT_PS_BASE_URL || DEFAULT_BASE_URL).replace(/\/$/, "");
 
+// Trimmed: a stray space or newline pasted into a Render env var is an easy
+// way to get "authentication failed" with a perfectly good password.
 function requireEnv(name) {
-  const v = process.env[name];
+  const v = (process.env[name] || "").trim();
   if (!v) throw new Error(`Missing required env var: ${name}`);
   return v;
 }
@@ -72,7 +74,7 @@ const arrayOf = (wrapper, itemName, values) =>
 // The id/password pair every PromoStandards request opens with.
 function credentials(svc) {
   const id = requireEnv("LAT_PS_ID");
-  const password = process.env.LAT_PS_PASSWORD; // optional per the schema
+  const password = (process.env.LAT_PS_PASSWORD || "").trim(); // optional per the schema
   return tag("wsVersion", svc.version) + tag("id", id) + (password ? tag("password", password) : "");
 }
 
@@ -206,6 +208,16 @@ function parseBody({ status, text }) {
   return body;
 }
 
+// LAT wraps its replies in <ResponseDataset> rather than the response
+// element its own schema names (seen in a real reply). So use the expected
+// name if it's there, otherwise whatever single element the Body holds —
+// and if neither, say what LAT actually sent.
+function responseOf(body, expectedName) {
+  const resp = body[expectedName] ?? Object.values(body).find((v) => v && typeof v === "object");
+  if (!resp) throw new Error(`LAT's reply had no ${expectedName} (it sent: ${Object.keys(body).join(", ") || "nothing"})`);
+  return resp;
+}
+
 function messagesOf(resp) {
   return toArray(resp?.ServiceMessageArray?.ServiceMessage).map((m) => ({
     code: num(m.code),
@@ -219,8 +231,7 @@ const describeMessages = (msgs) => msgs.map((m) => `${m.code ?? "?"}: ${m.descri
 const quantityOf = (q) => ({ value: num(q?.Quantity?.value ?? q?.value), uom: q?.Quantity?.uom ?? q?.uom ?? null });
 
 function normalizeInventory(body) {
-  const resp = body.GetInventoryLevelsResponse;
-  if (!resp) throw new Error("LAT inventory reply had no GetInventoryLevelsResponse");
+  const resp = responseOf(body, "GetInventoryLevelsResponse");
   const messages = messagesOf(resp);
   if (!resp.Inventory) {
     if (messages.some((m) => m.severity === "Error")) throw new Error(`LAT inventory error — ${describeMessages(messages)}`);
@@ -267,8 +278,7 @@ function normalizeInventory(body) {
 }
 
 function normalizeSellable(body) {
-  const resp = body.GetProductSellableResponse;
-  if (!resp) throw new Error("LAT product reply had no GetProductSellableResponse");
+  const resp = responseOf(body, "GetProductSellableResponse");
   const messages = messagesOf(resp);
   const items = toArray(resp.ProductSellableArray?.ProductSellable).map((s) => ({
     productId: s.productId,
@@ -280,9 +290,10 @@ function normalizeSellable(body) {
 }
 
 function normalizePricing(body) {
-  const resp = body.GetConfigurationAndPricingResponse;
-  if (!resp) throw new Error("LAT pricing reply had no GetConfigurationAndPricingResponse");
+  const resp = responseOf(body, "GetConfigurationAndPricingResponse");
   if (resp.ErrorMessage) throw new Error(`LAT pricing error ${resp.ErrorMessage.code ?? "?"}: ${resp.ErrorMessage.description ?? "no description"}`);
+  const messages = messagesOf(resp);
+  if (!resp.Configuration && messages.some((m) => m.severity === "Error")) throw new Error(`LAT pricing error — ${describeMessages(messages)}`);
   const c = resp.Configuration;
   if (!c) return { productId: null, currency: null, priceType: null, fobs: [], parts: [] };
   return {
@@ -319,6 +330,7 @@ function normalizeFobPoints(body) {
   const collectErrors = (node) => {
     if (node && typeof node === "object") {
       if (node.ErrorMessage) errors.push(node.ErrorMessage);
+      toArray(node.ServiceMessage).filter((m) => m.severity === "Error").forEach((m) => errors.push(m));
       Object.values(node).forEach(collectErrors);
     }
   };
