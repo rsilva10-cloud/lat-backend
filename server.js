@@ -3,6 +3,7 @@ const express = require("express");
 const cors = require("cors");
 const { requireAuth } = require("./sessionAuth");
 const { getInventoryLevels, getSellableProducts, getPricing, getFobPoints, PRICE_TYPES } = require("./client");
+const { getSupportedOrderTypes, previewPurchaseOrder } = require("./po");
 
 const app = express();
 
@@ -14,6 +15,12 @@ process.on("uncaughtException", (err) => console.error("Uncaught exception (serv
 const allowedOrigins = (process.env.ALLOWED_ORIGINS || "*").split(",").map((s) => s.trim());
 app.use(cors({ origin: allowedOrigins.includes("*") ? true : allowedOrigins }));
 
+app.use(express.json({ limit: "100kb" }));
+app.use((err, req, res, next) => {
+  if (err && err.type === "entity.parse.failed") return res.status(400).json({ error: "That request wasn't valid JSON." });
+  next(err);
+});
+
 app.get("/api/health", (req, res) => res.json({ ok: true }));
 
 // Wraps a handler so any failure becomes a clean 502 with LAT's own message.
@@ -23,7 +30,7 @@ const route = (fn) => async (req, res) => {
   try {
     res.json(await fn(req));
   } catch (err) {
-    if (err.status === 400) return res.status(400).json({ error: err.message });
+    if (err.status === 400) return res.status(400).json({ error: err.message, ...(err.details ? { details: err.details } : {}) });
     console.error("LAT request failed:", err.message);
     res.status(502).json({ error: err.message || "LAT request failed" });
   }
@@ -70,6 +77,16 @@ app.get("/api/lat/fob-points", requireAuth, route((req) => {
   if (!productId) throw badRequest("productId is required");
   return getFobPoints({ productId }, { raw: wantsRaw(req) });
 }));
+
+// ---------- Purchase orders (READ-ONLY in this version: nothing here can send an order) ----------
+
+// Read-only. Shows whether your login can use LAT's Purchase Order service
+// and which order types LAT accepts. Changes nothing at LAT.
+app.get("/api/lat/po/order-types", requireAuth, route(() => getSupportedOrderTypes()));
+
+// Checks an order against LAT's limits and returns the exact request that
+// would be sent, with the login shown as a placeholder. Sends nothing.
+app.post("/api/lat/po/preview", requireAuth, route((req) => previewPurchaseOrder(req.body)));
 
 const port = process.env.PORT || 3006;
 app.listen(port, () => console.log(`LAT backend listening on :${port}`));

@@ -48,6 +48,15 @@ const SERVICES = {
   },
 };
 
+// Purchase Order 1.0.0 (from LAT's WSDL: purchaseOrder.php, operations getSupportedOrderTypes and sendPO).
+SERVICES.purchaseOrder = {
+  path: "/purchaseOrder.php",
+  action: "getSupportedOrderTypes",
+  ns: "http://www.promostandards.org/WSDL/PO/1.0.0/",
+  shared: "http://www.promostandards.org/WSDL/PO/1.0.0/SharedObjects/",
+  version: "1.0.0",
+};
+
 const PRICE_TYPES = ["Customer", "List", "Net"]; // from LAT's schema
 const baseUrl = () => (process.env.LAT_PS_BASE_URL || DEFAULT_BASE_URL).replace(/\/$/, "");
 
@@ -213,7 +222,10 @@ function parseBody({ status, text }) {
 // name if it's there, otherwise whatever single element the Body holds —
 // and if neither, say what LAT actually sent.
 function responseOf(body, expectedName) {
-  const resp = body[expectedName] ?? Object.values(body).find((v) => v && typeof v === "object");
+  // An element that is present but empty (e.g. "no results") parses as "" —
+  // that is a valid, empty answer, not a missing one.
+  if (Object.prototype.hasOwnProperty.call(body, expectedName)) return body[expectedName] && typeof body[expectedName] === "object" ? body[expectedName] : {};
+  const resp = Object.values(body).find((v) => v && typeof v === "object");
   if (!resp) throw new Error(`LAT's reply had no ${expectedName} (it sent: ${Object.keys(body).join(", ") || "nothing"})`);
   return resp;
 }
@@ -413,7 +425,11 @@ const getPricing = (args, opts) => {
 };
 const getFobPoints = (args, opts) => run(SERVICES.pricing, "getFobPoints", buildFobPointsRequest(args), normalizeFobPoints, opts);
 
+// Plumbing shared with po.js (kept separate so ordering code stays in one place).
+const _shared = { SERVICES, tag, esc, credentials, requestElement, post, parseBody, responseOf, messagesOf, describeMessages, toArray, num };
+
 module.exports = {
+  _shared,
   getInventoryLevels,
   getSellableProducts,
   getPricing,
